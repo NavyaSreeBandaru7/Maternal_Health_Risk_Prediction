@@ -1,22 +1,3 @@
-#!/usr/bin/env python3
-"""
-Maternal Health Risk Prediction System - FastAPI Implementation
-============================================================
-Professional REST API for healthcare integration and production deployment.
-
-Features:
-- RESTful API endpoints for ML predictions
-- Authentication and authorization
-- Rate limiting and caching
-- Comprehensive error handling
-- API documentation with OpenAPI/Swagger
-- Database integration
-- Monitoring and logging
-
-Author: Senior AI Healthcare Engineer
-Version: 2.1.0
-"""
-
 import asyncio
 import logging
 import time

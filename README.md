@@ -31,6 +31,7 @@ Integration with existing hospital systems
 Mobile-responsive web interface
 
 Key Components
+
 🧠 ML Pipeline
 
 Data Processor: Advanced feature engineering and preprocessing
@@ -54,13 +55,11 @@ Integration APIs: EHR and hospital system connectivity
 
 📊 Performance Metrics
 
-Model Performance
-ModelAccuracyPrecisionRecallF1-ScoreAUC-ROCRandom Forest94.2%0.9430.9410.9420.987XGBoost93.8%0.9390.9370.9380.985Neural Network92.5%0.9260.9240.9250.982Ensemble95.1%0.9520.9500.9510.991
-Risk Category Distribution
-
-Low Risk: 70% of cases
-Medium Risk: 25% of cases
-High Risk: 5% of cases
+Model	Accuracy	Precision	Recall	F1-Score	AUC-ROC
+Random Forest	94.2%	0.943	0.941	0.942	0.987
+XGBoost	93.8%	0.939	0.937	0.938	0.985
+Neural Network	92.5%	0.926	0.924	0.925	0.982
+Ensemble	95.1%	0.952	0.950	0.951	0.991
 
 Feature Importance Rankings
 

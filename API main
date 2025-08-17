@@ -1,0 +1,487 @@
+#!/usr/bin/env python3
+"""
+Maternal Health Risk Prediction System - FastAPI Implementation
+============================================================
+Professional REST API for healthcare integration and production deployment.
+
+Features:
+- RESTful API endpoints for ML predictions
+- Authentication and authorization
+- Rate limiting and caching
+- Comprehensive error handling
+- API documentation with OpenAPI/Swagger
+- Database integration
+- Monitoring and logging
+
+Author: Senior AI Healthcare Engineer
+Version: 2.1.0
+"""
+
+import asyncio
+import logging
+import time
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any
+import json
+import uuid
+
+from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, validator
+import uvicorn
+
+# Database and Caching
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text, Boolean
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
+import redis
+from databases import Database
+
+# Authentication and Security
+import jwt
+from passlib.context import CryptContext
+from passlib.hash import bcrypt
+
+# Monitoring
+from prometheus_client import Counter, Histogram, generate_latest
+import sentry_sdk
+from sentry_sdk.integrations.fastapi import FastApiIntegration
+
+# Application imports
+from maternal_health_app import (
+    EnsemblePredictor, DataProcessor, NLPAnalyzer, 
+    HealthcareAgent, ConfigManager, RealTimeMonitor
+)
+
+# Initialize FastAPI app
+app = FastAPI(
+    title="Maternal Health Risk Prediction API",
+    description="Advanced AI-powered healthcare tool for maternal risk assessment",
+    version="2.1.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json"
+)
+
+# Security
+security = HTTPBearer()
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# Database setup
+DATABASE_URL = "postgresql://user:password@localhost:5432/maternal_health"
+database = Database(DATABASE_URL)
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# Redis for caching
+redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+
+# Monitoring metrics
+REQUEST_COUNT = Counter('requests_total', 'Total requests', ['method', 'endpoint', 'status'])
+REQUEST_DURATION = Histogram('request_duration_seconds', 'Request duration')
+PREDICTION_COUNT = Counter('predictions_total', 'Total predictions', ['risk_level'])
+
+# Initialize core components
+config_manager = ConfigManager()
+data_processor = DataProcessor(config_manager)
+predictor = EnsemblePredictor(config_manager)
+nlp_analyzer = NLPAnalyzer()
+healthcare_agent = HealthcareAgent(predictor, nlp_analyzer)
+monitor = RealTimeMonitor(config_manager)
+
+# Database Models
+class User(Base):
+    __tablename__ = "users"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String, unique=True, index=True)
+    email = Column(String, unique=True, index=True)
+    hashed_password = Column(String)
+    role = Column(String, default="user")
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class PredictionLog(Base):
+    __tablename__ = "prediction_logs"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(String, index=True)
+    user_id = Column(Integer, index=True)
+    input_data = Column(Text)
+    prediction_result = Column(Text)
+    risk_level = Column(String)
+    confidence = Column(Float)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+    processing_time = Column(Float)
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, index=True)
+    action = Column(String)
+    resource = Column(String)
+    details = Column(Text)
+    ip_address = Column(String)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+
+# Pydantic Models
+class PatientData(BaseModel):
+    age: int = Field(..., ge=15, le=50, description="Patient age in years")
+    systolic_bp: int = Field(..., ge=80, le=200, description="Systolic blood pressure")
+    diastolic_bp: int = Field(..., ge=40, le=120, description="Diastolic blood pressure")
+    blood_sugar: float = Field(..., ge=60, le=300, description="Blood sugar level")
+    body_temp: float = Field(..., ge=96, le=104, description="Body temperature in Fahrenheit")
+    heart_rate: int = Field(..., ge=50, le=150, description="Heart rate in BPM")
+    previous_complications: bool = Field(default=False, description="Previous pregnancy complications")
+    family_history: bool = Field(default=False, description="Family history of diabetes/hypertension")
+    multiple_pregnancy: bool = Field(default=False, description="Multiple pregnancy (twins, etc.)")
+    
+    @validator('systolic_bp')
+    def validate_systolic_bp(cls, v, values):
+        if 'diastolic_bp' in values and v <= values['diastolic_bp']:
+            raise ValueError('Systolic BP must be higher than diastolic BP')
+        return v
+
+class ClinicalNotes(BaseModel):
+    notes: str = Field(..., min_length=10, max_length=5000, description="Clinical notes text")
+    language: str = Field(default="en", description="Language of the notes")
+    
+class ChatMessage(BaseModel):
+    message: str = Field(..., min_length=1, max_length=1000, description="Chat message")
+    session_id: Optional[str] = Field(None, description="Session ID for conversation continuity")
+    patient_context: Optional[PatientData] = Field(None, description="Patient data for context")
+
+class UserCreate(BaseModel):
+    username: str = Field(..., min_length=3, max_length=50)
+    email: str = Field(..., regex=r'^[\w\.-]+@[\w\.-]+\.\w+$')
+    password: str = Field(..., min_length=8, max_length=100)
+    role: str = Field(default="user", regex=r'^(user|admin|doctor|nurse)$')
+
+class UserLogin(BaseModel):
+    username: str
+    password: str
+
+class PredictionResponse(BaseModel):
+    status: str
+    data: Dict[str, Any]
+    timestamp: datetime
+    session_id: str
+    processing_time: float
+
+class HealthCheck(BaseModel):
+    status: str
+    timestamp: datetime
+    version: str
+    database: str
+    models: str
+    cache: str
+
+# Middleware
+@app.middleware("http")
+async def add_process_time_header(request: Request, call_next):
+    start_time = time.time()
+    response = await call_next(request)
+    process_time = time.time() - start_time
+    response.headers["X-Process-Time"] = str(process_time)
+    
+    # Update metrics
+    REQUEST_DURATION.observe(process_time)
+    REQUEST_COUNT.labels(
+        method=request.method,
+        endpoint=request.url.path,
+        status=response.status_code
+    ).inc()
+    
+    return response
+
+# CORS configuration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://maternal-health-app.com", "http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Trusted hosts
+app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=["maternal-health-api.com", "*.maternal-health-api.com", "localhost"]
+)
+
+# Database dependency
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# Authentication functions
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password: str) -> str:
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(hours=24)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, "SECRET_KEY", algorithm="HS256")
+    return encoded_jwt
+
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security), 
+                          db: Session = Depends(get_db)):
+    try:
+        payload = jwt.decode(credentials.credentials, "SECRET_KEY", algorithms=["HS256"])
+        username: str = payload.get("sub")
+        if username is None:
+            raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+    
+    user = db.query(User).filter(User.username == username).first()
+    if user is None:
+        raise HTTPException(status_code=401, detail="User not found")
+    return user
+
+# Utility functions
+def log_prediction(db: Session, user_id: int, input_data: dict, result: dict, 
+                  processing_time: float, session_id: str):
+    """Log prediction for audit trail."""
+    prediction_log = PredictionLog(
+        session_id=session_id,
+        user_id=user_id,
+        input_data=json.dumps(input_data),
+        prediction_result=json.dumps(result),
+        risk_level=result.get('prediction', {}).get('risk_level', 'Unknown'),
+        confidence=result.get('prediction', {}).get('confidence', 0.0),
+        processing_time=processing_time
+    )
+    db.add(prediction_log)
+    db.commit()
+
+def log_audit(db: Session, user_id: int, action: str, resource: str, 
+              details: str, ip_address: str):
+    """Log user actions for security audit."""
+    audit_log = AuditLog(
+        user_id=user_id,
+        action=action,
+        resource=resource,
+        details=details,
+        ip_address=ip_address
+    )
+    db.add(audit_log)
+    db.commit()
+
+# API Endpoints
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize application on startup."""
+    await database.connect()
+    Base.metadata.create_all(bind=engine)
+    
+    # Initialize ML models (in production, load pre-trained models)
+    logging.info("Initializing ML models...")
+    
+    # Initialize Sentry for error tracking
+    sentry_sdk.init(
+        dsn="YOUR_SENTRY_DSN",
+        integrations=[FastApiIntegration(auto_enable=True)],
+        traces_sample_rate=0.1,
+    )
+    
+    logging.info("Application startup complete")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup on application shutdown."""
+    await database.disconnect()
+    logging.info("Application shutdown complete")
+
+@app.get("/", response_model=Dict[str, str])
+async def root():
+    """Root endpoint with API information."""
+    return {
+        "message": "Maternal Health Risk Prediction API",
+        "version": "2.1.0",
+        "status": "active",
+        "docs": "/docs",
+        "health": "/health"
+    }
+
+@app.get("/health", response_model=HealthCheck)
+async def health_check():
+    """Comprehensive health check endpoint."""
+    try:
+        # Check database
+        db_status = "healthy"
+        try:
+            await database.fetch_one("SELECT 1")
+        except:
+            db_status = "unhealthy"
+        
+        # Check Redis cache
+        cache_status = "healthy"
+        try:
+            redis_client.ping()
+        except:
+            cache_status = "unhealthy"
+        
+        # Check models
+        models_status = "healthy"
+        if not hasattr(predictor, 'ensemble') or predictor.ensemble is None:
+            models_status = "uninitialized"
+        
+        overall_status = "healthy" if all(s == "healthy" for s in [db_status, cache_status, models_status]) else "degraded"
+        
+        return HealthCheck(
+            status=overall_status,
+            timestamp=datetime.utcnow(),
+            version="2.1.0",
+            database=db_status,
+            models=models_status,
+            cache=cache_status
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Health check failed: {str(e)}")
+
+@app.post("/auth/register", response_model=Dict[str, str])
+async def register_user(user: UserCreate, db: Session = Depends(get_db)):
+    """Register a new user."""
+    # Check if user already exists
+    existing_user = db.query(User).filter(
+        (User.username == user.username) | (User.email == user.email)
+    ).first()
+    
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Username or email already registered")
+    
+    # Create new user
+    hashed_password = get_password_hash(user.password)
+    db_user = User(
+        username=user.username,
+        email=user.email,
+        hashed_password=hashed_password,
+        role=user.role
+    )
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    
+    return {"message": "User registered successfully", "user_id": str(db_user.id)}
+
+@app.post("/auth/login", response_model=Dict[str, str])
+async def login_user(user: UserLogin, request: Request, db: Session = Depends(get_db)):
+    """Authenticate user and return access token."""
+    db_user = db.query(User).filter(User.username == user.username).first()
+    
+    if not db_user or not verify_password(user.password, db_user.hashed_password):
+        # Log failed login attempt
+        log_audit(db, 0, "LOGIN_FAILED", "auth", f"Failed login for {user.username}", 
+                 request.client.host)
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    
+    if not db_user.is_active:
+        raise HTTPException(status_code=401, detail="User account is disabled")
+    
+    # Create access token
+    access_token = create_access_token(data={"sub": db_user.username})
+    
+    # Log successful login
+    log_audit(db, db_user.id, "LOGIN_SUCCESS", "auth", "Successful login", 
+             request.client.host)
+    
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user_id": str(db_user.id),
+        "role": db_user.role
+    }
+
+@app.post("/api/v1/predict", response_model=PredictionResponse)
+async def predict_risk(
+    patient_data: PatientData,
+    background_tasks: BackgroundTasks,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Predict maternal health risk based on patient data.
+    
+    This endpoint uses an ensemble of machine learning models to assess
+    maternal health risks and provides explainable AI insights.
+    """
+    session_id = str(uuid.uuid4())
+    start_time = time.time()
+    
+    try:
+        # Check cache first
+        cache_key = f"prediction:{hash(str(patient_data.dict()))}"
+        cached_result = redis_client.get(cache_key)
+        
+        if cached_result:
+            result = json.loads(cached_result)
+            processing_time = 0.001  # Cached response
+        else:
+            # Prepare input data
+            input_array = [
+                patient_data.age,
+                patient_data.systolic_bp,
+                patient_data.diastolic_bp,
+                patient_data.blood_sugar,
+                patient_data.body_temp,
+                patient_data.heart_rate,
+                int(patient_data.previous_complications),
+                int(patient_data.family_history),
+                int(patient_data.multiple_pregnancy)
+            ]
+            
+            # Make prediction
+            result = predictor.predict_with_explanation(np.array(input_array).reshape(1, -1))
+            processing_time = time.time() - start_time
+            
+            # Cache result for 1 hour
+            redis_client.setex(cache_key, 3600, json.dumps(result))
+        
+        # Update metrics
+        PREDICTION_COUNT.labels(risk_level=result['prediction']['risk_level']).inc()
+        
+        # Log prediction in background
+        background_tasks.add_task(
+            log_prediction, db, current_user.id, patient_data.dict(), 
+            result, processing_time, session_id
+        )
+        
+        # Log audit trail
+        background_tasks.add_task(
+            log_audit, db, current_user.id, "PREDICTION", "predict", 
+            f"Risk prediction for session {session_id}", request.client.host
+        )
+        
+        return PredictionResponse(
+            status="success",
+            data=result,
+            timestamp=datetime.utcnow(),
+            session_id=session_id,
+            processing_time=processing_time
+        )
+        
+    except Exception as e:
+        logging.error(f"Prediction error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
+
+@app.post("/api/v1/analyze-notes", response_model=Dict[str, Any])
+async def analyze_clinical_notes(
+    notes: C

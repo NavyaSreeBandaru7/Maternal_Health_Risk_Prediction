@@ -484,4 +484,413 @@ async def predict_risk(
 
 @app.post("/api/v1/analyze-notes", response_model=Dict[str, Any])
 async def analyze_clinical_notes(
-    notes: C
+    notes: ClinicalNotes,
+    background_tasks: BackgroundTasks,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Analyze clinical notes using NLP to extract risk factors and insights.
+    
+    This endpoint processes clinical text to identify medical entities,
+    risk factors, sentiment, and urgency indicators.
+    """
+    start_time = time.time()
+    
+    try:
+        # Check cache
+        cache_key = f"nlp_analysis:{hash(notes.notes)}"
+        cached_result = redis_client.get(cache_key)
+        
+        if cached_result:
+            analysis = json.loads(cached_result)
+        else:
+            # Perform NLP analysis
+            analysis = nlp_analyzer.analyze_clinical_notes(notes.notes)
+            
+            # Cache result for 30 minutes
+            redis_client.setex(cache_key, 1800, json.dumps(analysis))
+        
+        processing_time = time.time() - start_time
+        
+        # Log audit trail
+        background_tasks.add_task(
+            log_audit, db, current_user.id, "NLP_ANALYSIS", "analyze-notes",
+            f"Clinical notes analysis", request.client.host
+        )
+        
+        return {
+            "status": "success",
+            "data": analysis,
+            "timestamp": datetime.utcnow(),
+            "processing_time": processing_time,
+            "language": notes.language
+        }
+        
+    except Exception as e:
+        logging.error(f"NLP analysis error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+
+@app.post("/api/v1/chat", response_model=Dict[str, Any])
+async def chat_with_agent(
+    chat: ChatMessage,
+    background_tasks: BackgroundTasks,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Chat with the AI healthcare agent for medical insights and guidance.
+    
+    The agent can provide information about maternal health, risk factors,
+    recommendations, and answer clinical questions.
+    """
+    start_time = time.time()
+    session_id = chat.session_id or str(uuid.uuid4())
+    
+    try:
+        # Process patient context if provided
+        patient_data = None
+        if chat.patient_context:
+            patient_data = chat.patient_context.dict()
+        
+        # Get agent response
+        response = healthcare_agent.process_query(chat.message, patient_data)
+        processing_time = time.time() - start_time
+        
+        # Store conversation in cache for session continuity
+        conversation_key = f"conversation:{session_id}"
+        conversation = redis_client.get(conversation_key)
+        
+        if conversation:
+            conversation_data = json.loads(conversation)
+        else:
+            conversation_data = {"messages": []}
+        
+        conversation_data["messages"].extend([
+            {"role": "user", "content": chat.message, "timestamp": datetime.utcnow().isoformat()},
+            {"role": "assistant", "content": response, "timestamp": datetime.utcnow().isoformat()}
+        ])
+        
+        # Keep only last 20 messages
+        conversation_data["messages"] = conversation_data["messages"][-20:]
+        
+        # Cache for 2 hours
+        redis_client.setex(conversation_key, 7200, json.dumps(conversation_data))
+        
+        # Log audit trail
+        background_tasks.add_task(
+            log_audit, db, current_user.id, "CHAT", "chat",
+            f"Chat interaction in session {session_id}", request.client.host
+        )
+        
+        return {
+            "status": "success",
+            "data": {
+                "response": response,
+                "session_id": session_id,
+                "conversation_length": len(conversation_data["messages"])
+            },
+            "timestamp": datetime.utcnow(),
+            "processing_time": processing_time
+        }
+        
+    except Exception as e:
+        logging.error(f"Chat error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Chat failed: {str(e)}")
+
+@app.get("/api/v1/conversation/{session_id}", response_model=Dict[str, Any])
+async def get_conversation_history(
+    session_id: str,
+    current_user: User = Depends(get_current_user)
+):
+    """Get conversation history for a specific session."""
+    try:
+        conversation_key = f"conversation:{session_id}"
+        conversation = redis_client.get(conversation_key)
+        
+        if not conversation:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        
+        conversation_data = json.loads(conversation)
+        
+        return {
+            "status": "success",
+            "data": conversation_data,
+            "session_id": session_id,
+            "timestamp": datetime.utcnow()
+        }
+        
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500, detail="Invalid conversation data")
+    except Exception as e:
+        logging.error(f"Conversation retrieval error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve conversation: {str(e)}")
+
+@app.post("/api/v1/monitoring/start", response_model=Dict[str, str])
+async def start_patient_monitoring(
+    patient_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Start real-time monitoring for a patient."""
+    try:
+        # Simulate data stream function
+        def mock_data_stream():
+            return {
+                'heart_rate': np.random.normal(75, 10),
+                'systolic_bp': np.random.normal(120, 15),
+                'diastolic_bp': np.random.normal(80, 10),
+                'temperature': np.random.normal(98.6, 1),
+                'blood_sugar': np.random.normal(100, 20)
+            }
+        
+        monitor.start_monitoring(patient_id, mock_data_stream)
+        
+        # Log audit trail
+        log_audit(db, current_user.id, "START_MONITORING", "monitoring",
+                 f"Started monitoring for patient {patient_id}", "system")
+        
+        return {
+            "status": "success",
+            "message": f"Monitoring started for patient {patient_id}",
+            "patient_id": patient_id
+        }
+        
+    except Exception as e:
+        logging.error(f"Monitoring start error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to start monitoring: {str(e)}")
+
+@app.post("/api/v1/monitoring/stop", response_model=Dict[str, str])
+async def stop_patient_monitoring(
+    patient_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Stop real-time monitoring for a patient."""
+    try:
+        monitor.stop_monitoring(patient_id)
+        
+        # Log audit trail
+        log_audit(db, current_user.id, "STOP_MONITORING", "monitoring",
+                 f"Stopped monitoring for patient {patient_id}", "system")
+        
+        return {
+            "status": "success",
+            "message": f"Monitoring stopped for patient {patient_id}",
+            "patient_id": patient_id
+        }
+        
+    except Exception as e:
+        logging.error(f"Monitoring stop error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to stop monitoring: {str(e)}")
+
+@app.get("/api/v1/monitoring/alerts", response_model=Dict[str, Any])
+async def get_monitoring_alerts(
+    current_user: User = Depends(get_current_user)
+):
+    """Get summary of monitoring alerts."""
+    try:
+        alert_summary = monitor.get_alert_summary()
+        
+        return {
+            "status": "success",
+            "data": alert_summary,
+            "timestamp": datetime.utcnow()
+        }
+        
+    except Exception as e:
+        logging.error(f"Alert retrieval error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve alerts: {str(e)}")
+
+@app.get("/api/v1/analytics/predictions", response_model=Dict[str, Any])
+async def get_prediction_analytics(
+    days: int = 7,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get prediction analytics for the specified number of days."""
+    try:
+        # Check admin access for detailed analytics
+        if current_user.role not in ["admin", "doctor"]:
+            raise HTTPException(status_code=403, detail="Insufficient permissions")
+        
+        # Query prediction logs
+        since_date = datetime.utcnow() - timedelta(days=days)
+        predictions = db.query(PredictionLog).filter(
+            PredictionLog.timestamp >= since_date
+        ).all()
+        
+        # Calculate analytics
+        total_predictions = len(predictions)
+        risk_distribution = {}
+        avg_confidence = 0
+        avg_processing_time = 0
+        
+        if predictions:
+            risk_levels = [p.risk_level for p in predictions]
+            risk_distribution = {level: risk_levels.count(level) for level in set(risk_levels)}
+            avg_confidence = sum(p.confidence for p in predictions) / total_predictions
+            avg_processing_time = sum(p.processing_time for p in predictions) / total_predictions
+        
+        return {
+            "status": "success",
+            "data": {
+                "total_predictions": total_predictions,
+                "risk_distribution": risk_distribution,
+                "average_confidence": round(avg_confidence, 3),
+                "average_processing_time": round(avg_processing_time, 4),
+                "period_days": days
+            },
+            "timestamp": datetime.utcnow()
+        }
+        
+    except Exception as e:
+        logging.error(f"Analytics error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve analytics: {str(e)}")
+
+@app.get("/api/v1/models/info", response_model=Dict[str, Any])
+async def get_model_info(current_user: User = Depends(get_current_user)):
+    """Get information about the deployed models."""
+    try:
+        model_info = {
+            "ensemble_model": {
+                "status": "active" if hasattr(predictor, 'ensemble') else "inactive",
+                "algorithms": ["Random Forest", "XGBoost", "Neural Network"],
+                "version": "2.1.0",
+                "last_trained": "2024-01-15T10:00:00Z"
+            },
+            "nlp_model": {
+                "status": "active" if nlp_analyzer.nlp else "inactive",
+                "language_model": "en_core_web_sm",
+                "medical_ner": "biomedical-ner-all",
+                "sentiment_model": "cardiffnlp/twitter-roberta-base-sentiment-latest"
+            },
+            "feature_names": predictor.feature_names if hasattr(predictor, 'feature_names') else [],
+            "risk_categories": ["Low Risk", "Medium Risk", "High Risk"]
+        }
+        
+        return {
+            "status": "success",
+            "data": model_info,
+            "timestamp": datetime.utcnow()
+        }
+        
+    except Exception as e:
+        logging.error(f"Model info error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve model info: {str(e)}")
+
+@app.get("/metrics")
+async def get_metrics():
+    """Prometheus metrics endpoint."""
+    return Response(generate_latest(), media_type="text/plain")
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Custom HTTP exception handler."""
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "status": "error",
+            "message": exc.detail,
+            "timestamp": datetime.utcnow().isoformat(),
+            "path": request.url.path
+        }
+    )
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    """General exception handler for unhandled errors."""
+    logging.error(f"Unhandled exception: {str(exc)}")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "status": "error",
+            "message": "Internal server error",
+            "timestamp": datetime.utcnow().isoformat(),
+            "path": request.url.path
+        }
+    )
+
+# Rate limiting middleware
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# Apply rate limiting to prediction endpoints
+@limiter.limit("10/minute")
+@app.post("/api/v1/predict-limited")
+async def predict_risk_limited(request: Request, patient_data: PatientData, 
+                              current_user: User = Depends(get_current_user)):
+    """Rate-limited prediction endpoint for high-volume usage."""
+    return await predict_risk(patient_data, BackgroundTasks(), request, current_user, get_db())
+
+# WebSocket support for real-time updates
+from fastapi import WebSocket, WebSocketDisconnect
+import json
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+    
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+    
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.remove(websocket)
+    
+    async def send_personal_message(self, message: str, websocket: WebSocket):
+        await websocket.send_text(message)
+    
+    async def broadcast(self, message: str):
+        for connection in self.active_connections:
+            try:
+                await connection.send_text(message)
+            except:
+                # Connection closed, remove it
+                self.active_connections.remove(connection)
+
+manager = ConnectionManager()
+
+@app.websocket("/ws/alerts")
+async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket endpoint for real-time alerts."""
+    await manager.connect(websocket)
+    try:
+        while True:
+            # Keep connection alive and send periodic updates
+            await asyncio.sleep(30)
+            
+            # Send alert summary
+            alert_summary = monitor.get_alert_summary()
+            await manager.send_personal_message(
+                json.dumps({
+                    "type": "alert_summary",
+                    "data": alert_summary,
+                    "timestamp": datetime.utcnow().isoformat()
+                }),
+                websocket
+            )
+            
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+
+if __name__ == "__main__":
+    # Production configuration
+    config = {
+        "host": "0.0.0.0",
+        "port": 8000,
+        "workers": 4,
+        "log_level": "info",
+        "access_log": True,
+        "use_colors": True,
+        "reload": False  # Set to True for development
+    }
+    
+    uvicorn.run("api.main:app", **config)
